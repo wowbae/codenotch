@@ -86,10 +86,14 @@ enum CursorSafeStorage {
     }
 
     private static func aes128CBCDecrypt(ciphertext: Data, key: Data) -> String? {
+        // capacity captured outside the exclusive `out` borrow — newer Swift
+        // rejects `out.count` inside `out.withUnsafeMutableBytes`.
+        let capacity = ciphertext.count + kCCBlockSizeAES128
         var outLength = 0
-        var out = Data(count: ciphertext.count + kCCBlockSizeAES128)
-        let status = out.withUnsafeMutableBytes { outBytes in
-            ciphertext.withUnsafeBytes { cipherBytes in
+        var out = Data(count: capacity)
+        let status = out.withUnsafeMutableBytes { outBytes -> CCCryptorStatus in
+            guard let outBase = outBytes.baseAddress else { return CCCryptorStatus(kCCParamError) }
+            return ciphertext.withUnsafeBytes { cipherBytes in
                 key.withUnsafeBytes { keyBytes in
                     iv.withUnsafeBytes { ivBytes in
                         CCCrypt(
@@ -99,7 +103,7 @@ enum CursorSafeStorage {
                             keyBytes.baseAddress, key.count,
                             ivBytes.baseAddress,
                             cipherBytes.baseAddress, ciphertext.count,
-                            outBytes.baseAddress, out.count,
+                            outBase, capacity,
                             &outLength
                         )
                     }
