@@ -74,6 +74,7 @@ actor CursorLocalProvider: UsageProvider {
             status: .ok,
             windows: windows,
             headlineID: CursorUsage.headlineID(in: windows),
+            weeklyID: CursorWowbaePatches.weeklyID(for: windows),
             plan: CursorUsage.plan(fromJSON: body) ?? account()?.plan?.nonEmptyPlan
         )
     }

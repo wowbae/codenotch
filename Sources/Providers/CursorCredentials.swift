@@ -102,8 +102,11 @@ struct CursorCredentials {
         guard let db = SQLiteStore.open(url) else { throw UsageProviderError.needsAuth }
         defer { sqlite3_close(db) }
 
-        guard let token = value(forKey: "cursorAuth/accessToken", in: db),
-              !token.isEmpty
+        guard let stored = value(forKey: "cursorAuth/accessToken", in: db),
+              !stored.isEmpty
+        else { throw UsageProviderError.needsAuth }
+
+        guard let token = CursorSafeStorage.decodeAccessToken(stored), !token.isEmpty
         else { throw UsageProviderError.needsAuth }
 
         // Prefer the editor's cached WorkOS id when present. Recent Cursor
