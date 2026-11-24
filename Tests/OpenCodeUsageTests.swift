@@ -1,0 +1,692 @@
+import XCTest
+import SQLite3
+@testable import Codenotch
+
+/// The Go plan windows, pinned to the live response (secret redacted) — the
+/// same figures the OpenCode dashboard shows.
+final class OpenCodeUsageTests: XCTestCase {
+    /// Verbatim from `GET /zen/go/v1/usage`, 2026-09-06.
+    private let payload = """
+    {"usage":{\
+    "rolling":{"status":"ok","percent":0,"resetsAt":"2026-09-06T12:31:06.611Z"},\
+    "weekly":{"status":"ok","percent":0,"resetsAt":"2026-09-07T00:00:00.611Z"},\
+    "monthly":{"status":"ok","percent":0,"resetsAt":"2026-10-03T13:09:45.611Z"}}}
+    """
+
+    func testReadsAllThreeWindows() throws {
+        let w = try OpenCodeUsage.windows(fromJSON: payload)
+        XCTAssertEqual(w.map(\.duration), [18000, 604800, 30 * 86400])
+        XCTAssertEqual(w.map(\.id), ["rolling", "weekly", "monthly"])
+        XCTAssertEqual(w.map(\.label), ["5h limit", "Weekly limit", "Monthly limit"])
+        XCTAssertTrue(w.allSatisfy { ($0.usedFraction ?? -1) == 0 })
+    }
+
+    /// `percent` is used, matching the dashboard's "X% used" — the ring must
+    /// not invert it.
+    func testPercentIsUsedNotRemaining() throws {
+        let json = """
+        {"usage":{"rolling":{"status":"ok","percent":65,"resetsAt":"2026-09-06T12:31:06.611Z"}}}
+        """
+        let w = try OpenCodeUsage.windows(fromJSON: json)
+        XCTAssertEqual(w.count, 1)
+        XCTAssertEqual(w[0].usedFraction ?? -1, 0.65, accuracy: 0.0001)
+    }
+
+    /// The reset carries milliseconds, which the plain ISO8601 formatter
+    /// refuses — reading only that form silently loses every reset time.
+    func testReadsAMillisecondResetTime() throws {
+        let w = try OpenCodeUsage.windows(fromJSON: payload)
+        let rolling = try XCTUnwrap(w.first { $0.id == "rolling" })
+        let at = try XCTUnwrap(rolling.resetsAt)
+        let plain = ISO8601DateFormatter().date(from: "2026-09-06T12:31:06Z")!
+        XCTAssertEqual(at.timeIntervalSince1970, plain.timeIntervalSince1970, accuracy: 1)
+    }
+
+    /// A window without a percent is dropped rather than invented; with none
+    /// left at all that is a bad response, not zeros.
+    func testWindowsWithoutAPercentAreDropped() throws {
+        let json = """
+        {"usage":{"rolling":{"status":"ok"},"weekly":{"status":"ok","percent":3}}}
+        """
+        let w = try OpenCodeUsage.windows(fromJSON: json)
+        XCTAssertEqual(w.map(\.id), ["weekly"])
+    }
+
+    func testAnEmptyUsageIsNotAReading() {
+        for json in ["{}", #"{"usage":{}}"#,
+                     #"{"usage":{"rolling":{"status":"ok"}}}"#] {
+            XCTAssertThrowsError(try OpenCodeUsage.windows(fromJSON: json)) { error in
+                guard case UsageProviderError.badResponse = error else {
+                    return XCTFail("expected badResponse, got \(error)")
+                }
+            }
+        }
+    }
+}
+
+/// The credential is borrowed from OpenCode's own sign-in, so only OpenCode's
+/// two ids may ever be claimed — any other entry is somebody else's account.
+final class OpenCodeCredentialsTests: XCTestCase {
+    private func file(_ text: String) throws -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-auth-\(UUID().uuidString).json")
+        try text.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    func testReadsTheGoKey() throws {
+        let url = try file(#"{"opencode-go":{"type":"api","key":"sk-go-live"}}"#)
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertEqual(OpenCodeCredentials.loadGoKey(from: url)?.token, "sk-go-live")
+    }
+
+    func testReadsABareStringEntry() throws {
+        let url = try file(#"{"opencode-go":"sk-go-live"}"#)
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertEqual(OpenCodeCredentials.loadGoKey(from: url)?.token, "sk-go-live")
+    }
+
+    func testNeverClaimsAnotherVendorsKey() throws {
+        let url = try file(
+            #"{"openai":{"type":"api","key":"sk-openai"},"google":{"type":"api","key":"g-key"}}"#)
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertNil(OpenCodeCredentials.loadGoKey(from: url))
+    }
+
+    func testAnEmptyKeyIsMissing() throws {
+        let url = try file(#"{"opencode-go":{"type":"api","key":""}}"#)
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertNil(OpenCodeCredentials.loadGoKey(from: url))
+    }
+
+    // MARK: - The OAuth sign-in OpenCode 1.18 moved into SQLite
+
+    /// An OAuth sign-in carries an org and a console, and no Go key — which is
+    /// the whole reason it needs a different endpoint.
+    func testOAuthCarriesOrgConsoleAndExpiry() throws {
+        let entry = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(#"""
+        {"type":"oauth","methodID":"device","refresh":"rt_x","access":"st_abc",
+         "expires":1792854570201,
+         "metadata":{"server":"https://opencode.ai/console","orgID":"org_1",
+                     "orgName":"Personal"}}
+        """#.utf8)))
+        let c = try XCTUnwrap(OpenCodeCredentials.credential(from: entry, source: "OpenCode"))
+        XCTAssertEqual(c.token, "st_abc")
+        XCTAssertTrue(c.oauth)
+        XCTAssertEqual(c.org, "org_1")
+        XCTAssertEqual(c.console?.absoluteString, "https://opencode.ai/console")
+        XCTAssertEqual(c.expires?.timeIntervalSince1970 ?? 0, 1_792_854_570.201, accuracy: 0.001)
+    }
+
+    /// `expires` is a number in auth.json and a string in opencode.db; a reader
+    /// that takes one shape silently loses the expiry hint on the other.
+    func testTheDatabaseWritesExpiresAsAString() throws {
+        let entry = try XCTUnwrap(try JSONSerialization.jsonObject(
+            with: Data(#"{"type":"oauth","access":"st_abc","expires":"1792877970039"}"#.utf8)))
+        let c = try XCTUnwrap(OpenCodeCredentials.credential(from: entry, source: "OpenCode"))
+        XCTAssertEqual(c.expires?.timeIntervalSince1970 ?? 0, 1_792_877_970.039, accuracy: 0.001)
+    }
+
+    /// An OAuth entry with no access token is not a credential.
+    func testAnOAuthEntryWithoutATokenIsMissing() {
+        XCTAssertNil(OpenCodeCredentials.credential(
+            from: ["type": "oauth", "access": ""], source: "OpenCode"))
+    }
+
+    /// The credential decides the route and each route refuses the other's, so
+    /// this pairing is the fix rather than a detail.
+    func testEachCredentialGoesToTheRouteThatAcceptsIt() {
+        let oauth = OpenCodeCredentials.Credential(
+            token: "st_x", oauth: true, console: nil, org: nil, expires: nil, source: "OpenCode")
+        let key = OpenCodeCredentials.Credential(
+            token: "sk-go", oauth: false, console: nil, org: nil, expires: nil, source: "OpenCode")
+        XCTAssertEqual(OpenCodeProvider.endpoint(for: oauth).absoluteString,
+                       "https://opencode.ai/inference/go/v1/usage")
+        XCTAssertEqual(OpenCodeProvider.endpoint(for: key).absoluteString,
+                       "https://opencode.ai/zen/go/v1/usage")
+    }
+
+    // MARK: - The database
+
+    /// A `credential` table shaped as OpenCode writes it: values are JSON
+    /// strings, and `active` is present on some rows and absent on others.
+    private func database(
+        _ rows: [(id: String, value: String, active: Int?, updated: Int)],
+        wal: Bool = false
+    ) throws -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-\(UUID().uuidString).db")
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer {
+            sqlite3_close(db)
+            // OpenCode runs its store in WAL mode, and once it has quit there
+            // is no `-wal` or `-shm` sidecar beside the file: that is the
+            // state every read-only open meets whenever OpenCode is closed.
+            if wal {
+                for sidecar in ["-wal", "-shm"] {
+                    try? FileManager.default.removeItem(atPath: url.path + sidecar)
+                }
+            }
+        }
+        if wal {
+            XCTAssertEqual(sqlite3_exec(db, "PRAGMA journal_mode=WAL", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertEqual(sqlite3_exec(db, """
+        CREATE TABLE credential (id text PRIMARY KEY, integration_id text, label text NOT NULL,
+         value text NOT NULL, connector_id text, method_id text, active integer,
+         time_created integer NOT NULL, time_updated integer NOT NULL)
+        """, nil, nil, nil), SQLITE_OK)
+        for (index, row) in rows.enumerated() {
+            let escaped = row.value.replacingOccurrences(of: "'", with: "''")
+            let active = row.active.map(String.init) ?? "NULL"
+            XCTAssertEqual(sqlite3_exec(db, """
+            INSERT INTO credential VALUES ('cred_\(index)', '\(row.id)', 'x', '\(escaped)',
+             NULL, NULL, \(active), 0, \(row.updated))
+            """, nil, nil, nil), SQLITE_OK)
+        }
+        return url
+    }
+
+    /// **OpenCode not running.** Its store is a WAL database, and once the
+    /// last connection has closed there is no `-shm` sidecar for a read-only
+    /// connection to map. SQLite still reports that connection as opened; it
+    /// is the first statement that fails. Taken at its word, the store read as
+    /// empty, the only sign-in left to try was the retired Go key in
+    /// `auth.json`, and the ring said "signed out" after every reboot until
+    /// OpenCode was launched by hand.
+    func testReadsACheckpointedWALDatabaseWhileOpenCodeIsClosed() throws {
+        let db = try database([
+            ("opencode-go", #"{"type":"api","key":"sk-old"}"#, nil, 1),
+            ("opencode", #"{"type":"oauth","access":"st_live","metadata":{"orgID":"org_1"}}"#, 1, 3)
+        ], wal: true)
+        defer { try? FileManager.default.removeItem(at: db) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: db.path + "-shm"),
+                       "the fixture must look like a store whose owner has quit")
+
+        let found = OpenCodeCredentials.candidatesFromDatabase(db)
+        XCTAssertEqual(found.map(\.token), ["sk-old", "st_live"])
+
+        // And through the combined loader, with the stale key mirrored in the
+        // file: the live sign-in must still be on the list to try.
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.copyItem(at: db, to: directory.appendingPathComponent("opencode.db"))
+        try #"{"opencode-go":{"type":"api","key":"sk-old"}}"#
+            .write(to: directory.appendingPathComponent("auth.json"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(OpenCodeCredentials.candidates(in: directory).map(\.token), ["sk-old", "st_live"])
+    }
+
+    /// The case that broke the ring: no `auth.json` at all, only the database
+    /// OpenCode 1.18+ writes.
+    func testReadsTheSignInFromTheDatabaseAlone() throws {
+        let db = try database([("opencode",
+            #"{"type":"oauth","access":"st_new","metadata":{"orgID":"org_1"}}"#, 1, 3)])
+        defer { try? FileManager.default.removeItem(at: db) }
+
+        let c = try XCTUnwrap(OpenCodeCredentials.loadFromDatabase(db))
+        XCTAssertEqual(c.token, "st_new")
+        XCTAssertTrue(c.oauth)
+        XCTAssertEqual(c.org, "org_1")
+    }
+
+    /// The combined loader, on a directory holding the database and nothing
+    /// else — no `auth.json` anywhere.
+    func testTheCombinedLoaderFindsTheDatabaseAlone() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let db = try database([("opencode", #"{"type":"oauth","access":"st_new"}"#, 1, 3)])
+        defer { try? FileManager.default.removeItem(at: db) }
+        try FileManager.default.copyItem(at: db, to: directory.appendingPathComponent("opencode.db"))
+
+        XCTAssertEqual(OpenCodeCredentials.load(in: directory)?.token, "st_new")
+    }
+
+    // MARK: - Which source wins
+
+    /// A console key in the database still beats a stale `sk-` key left in
+    /// `auth.json`. A file console key beats a database row only when that
+    /// row is not itself a console key.
+    func testTheDatabaseBeatsAStaleFileKey() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try #"{"opencode-go":{"type":"api","key":"sk-stale"}}"#
+            .write(to: directory.appendingPathComponent("auth.json"), atomically: true,
+                   encoding: .utf8)
+        let db = try database([("opencode-go", #"{"type":"api","key":"oc_sk_live"}"#, 1, 3)])
+        defer { try? FileManager.default.removeItem(at: db) }
+        try FileManager.default.copyItem(at: db, to: directory.appendingPathComponent("opencode.db"))
+
+        XCTAssertEqual(OpenCodeCredentials.load(in: directory)?.token, "oc_sk_live")
+    }
+
+    /// A file with no database behind it — the pre-1.18 machine, or one whose
+    /// database cannot be opened — still reads. The reorder must not trade the
+    /// 2.x fix for this one.
+    func testTheFileStillServesWhenTheDatabaseIsMissing() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try #"{"opencode-go":{"type":"api","key":"sk-file-only"}}"#
+            .write(to: directory.appendingPathComponent("auth.json"), atomically: true,
+                   encoding: .utf8)
+
+        XCTAssertEqual(OpenCodeCredentials.load(in: directory)?.token, "sk-file-only")
+    }
+
+    /// A database carrying no OpenCode row — signed out in the app, say — does
+    /// not hide a legacy sign-in the file still holds: with no answer of its
+    /// own, the database is only ever allowed to pass the question to the file.
+    func testADatabaseWithoutASignInFallsBackToTheFile() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try #"{"opencode-go":{"type":"api","key":"sk-legacy"}}"#
+            .write(to: directory.appendingPathComponent("auth.json"), atomically: true,
+                   encoding: .utf8)
+        let db = try database([("openrouter", #"{"type":"api","key":"sk-or"}"#, 1, 3)])
+        defer { try? FileManager.default.removeItem(at: db) }
+        try FileManager.default.copyItem(at: db, to: directory.appendingPathComponent("opencode.db"))
+
+        XCTAssertEqual(OpenCodeCredentials.load(in: directory)?.token, "sk-legacy")
+    }
+
+    /// Console migration: the live key is `auth.json` `"opencode"` as an API
+    /// key, and the leftover `"opencode-go"` `sk-` entry must not be sent.
+    func testAConsoleKeyInAuthJsonBeatsALeftoverGoKey() throws {
+        let directory = try homeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try consoleAuth().write(to: directory.appendingPathComponent("auth.json"),
+                                 atomically: true, encoding: .utf8)
+
+        let c = try XCTUnwrap(OpenCodeCredentials.load(in: directory))
+        XCTAssertEqual(c.token, "oc_sk_console")
+        XCTAssertFalse(c.oauth)
+        XCTAssertEqual(OpenCodeProvider.endpoint(for: c).absoluteString,
+                       "https://opencode.ai/zen/go/v1/usage")
+    }
+
+    /// A database row must not hide a console key that lives only in the file.
+    /// The database still wins when it holds the `oc_sk_` key itself — that
+    /// case is `testTheDatabaseBeatsAStaleFileKey`.
+    func testAConsoleKeyInAuthJsonBeatsAStaleDatabaseGoKey() throws {
+        let directory = try homeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try consoleAuth().write(to: directory.appendingPathComponent("auth.json"),
+                                 atomically: true, encoding: .utf8)
+        let db = try database([("opencode-go", #"{"type":"api","key":"sk-stale"}"#, 1, 3)])
+        defer { try? FileManager.default.removeItem(at: db) }
+        try FileManager.default.copyItem(at: db, to: directory.appendingPathComponent("opencode.db"))
+
+        let c = try XCTUnwrap(OpenCodeCredentials.load(in: directory))
+        XCTAssertEqual(c.token, "oc_sk_console")
+        XCTAssertFalse(c.oauth)
+    }
+
+    /// No console key: an OAuth-only `auth.json` is still the sign-in, on the
+    /// inference route, and a lone `opencode-go` `sk-` key is still that key.
+    func testOAuthOnlyAuthJsonAndALoneGoKeyStayOnTheOldPath() throws {
+        let oauthHome = try homeDirectory()
+        defer { try? FileManager.default.removeItem(at: oauthHome) }
+        try #"{"opencode":{"type":"oauth","access":"st_file"}}"#
+            .write(to: oauthHome.appendingPathComponent("auth.json"),
+                   atomically: true, encoding: .utf8)
+        let oauth = try XCTUnwrap(OpenCodeCredentials.load(in: oauthHome))
+        XCTAssertEqual(oauth.token, "st_file")
+        XCTAssertTrue(oauth.oauth)
+        XCTAssertEqual(OpenCodeProvider.endpoint(for: oauth).absoluteString,
+                       "https://opencode.ai/inference/go/v1/usage")
+
+        let keyHome = try homeDirectory()
+        defer { try? FileManager.default.removeItem(at: keyHome) }
+        try #"{"opencode-go":{"type":"api","key":"sk-lone"}}"#
+            .write(to: keyHome.appendingPathComponent("auth.json"),
+                   atomically: true, encoding: .utf8)
+        let key = try XCTUnwrap(OpenCodeCredentials.load(in: keyHome))
+        XCTAssertEqual(key.token, "sk-lone")
+        XCTAssertFalse(key.oauth)
+        XCTAssertEqual(OpenCodeProvider.endpoint(for: key).absoluteString,
+                       "https://opencode.ai/zen/go/v1/usage")
+    }
+
+    private func homeDirectory() throws -> URL {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    private func consoleAuth() -> String {
+        #"{"opencode-go":{"type":"api","key":"sk-stale"},"opencode":{"type":"api","key":"oc_sk_console"}}"#
+    }
+
+    func testTheDatabaseNeverClaimsAnotherVendorsRow() throws {
+        let db = try database([("openrouter", #"{"type":"api","key":"sk-or"}"#, nil, 5)])
+        defer { try? FileManager.default.removeItem(at: db) }
+        XCTAssertNil(OpenCodeCredentials.loadFromDatabase(db))
+    }
+
+    /// A Go key beats an OAuth sign-in even when the OAuth row is newer, so a
+    /// machine holding both reads the same account whichever file is consulted.
+    func testTheDatabasePrefersAGoKey() throws {
+        let db = try database([
+            ("opencode", #"{"type":"oauth","access":"st_oauth"}"#, 1, 9),
+            ("opencode-go", #"{"type":"api","key":"sk-go"}"#, nil, 1),
+        ])
+        defer { try? FileManager.default.removeItem(at: db) }
+        let c = try XCTUnwrap(OpenCodeCredentials.loadFromDatabase(db))
+        XCTAssertEqual(c.token, "sk-go")
+        XCTAssertFalse(c.oauth)
+    }
+
+    /// A row OpenCode has retired is not a sign-in. A row that omits `active`
+    /// entirely still is — both shapes have shipped.
+    func testTheDatabaseSkipsRetiredRows() throws {
+        let db = try database([
+            ("opencode", #"{"type":"oauth","access":"st_old"}"#, 0, 9),
+            ("opencode", #"{"type":"oauth","access":"st_live"}"#, nil, 1),
+        ])
+        defer { try? FileManager.default.removeItem(at: db) }
+        XCTAssertEqual(OpenCodeCredentials.loadFromDatabase(db)?.token, "st_live")
+    }
+
+    /// The case behind the empty ring on OpenCode 2.x: the database still
+    /// holds the Go key it imported from `auth.json`, now expired at the
+    /// console, beside the live OAuth sign-in. The key keeps its place at the
+    /// front, and the sign-in is offered behind it rather than hidden by it.
+    func testTheDatabaseOffersTheSignInBehindTheGoKey() throws {
+        let db = try database([
+            ("opencode-go", #"{"type":"key","key":"sk-expired"}"#, nil, 1),
+            ("opencode", #"{"type":"oauth","access":"st_live","metadata":{"orgID":"org_1"}}"#, 1, 9),
+        ])
+        defer { try? FileManager.default.removeItem(at: db) }
+        let found = OpenCodeCredentials.candidatesFromDatabase(db)
+        XCTAssertEqual(found.map(\.token), ["sk-expired", "st_live"])
+        XCTAssertEqual(found.map(\.oauth), [false, true])
+        XCTAssertEqual(OpenCodeCredentials.loadFromDatabase(db)?.token, "sk-expired")
+    }
+
+    /// One of each id, the newest: an older row of the same id is the one the
+    /// newer replaced, not a third sign-in to try.
+    func testTheDatabaseOffersOneCredentialPerId() throws {
+        let db = try database([
+            ("opencode", #"{"type":"oauth","access":"st_old"}"#, nil, 1),
+            ("opencode", #"{"type":"oauth","access":"st_new"}"#, nil, 9),
+        ])
+        defer { try? FileManager.default.removeItem(at: db) }
+        XCTAssertEqual(OpenCodeCredentials.candidatesFromDatabase(db).map(\.token), ["st_new"])
+    }
+
+    // MARK: - The provider's fallback
+
+    private func provider(_ credentials: [OpenCodeCredentials.Credential]) throws -> OpenCodeProvider {
+        let suite = "OpenCodeUsageTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return OpenCodeProvider(session: OpenCodeEndpoint.session(),
+                                archive: UsageArchive(defaults: defaults),
+                                credentials: { credentials })
+    }
+
+    private var expiredKey: OpenCodeCredentials.Credential {
+        OpenCodeCredentials.Credential(token: "sk-expired", oauth: false, console: nil,
+                                       org: nil, expires: nil, source: "OpenCode")
+    }
+
+    private var liveSignIn: OpenCodeCredentials.Credential {
+        OpenCodeCredentials.Credential(token: "st_live", oauth: true, console: nil,
+                                       org: "org_1", expires: nil, source: "OpenCode")
+    }
+
+    /// The Go key answers 401 and the sign-in beside it answers 200: the
+    /// reading comes from the sign-in, by way of its own route, and the ring
+    /// is not told to connect a plan that is connected.
+    func testAnExpiredGoKeyFallsThroughToTheLiveSignIn() async throws {
+        OpenCodeEndpoint.reset([
+            .init(status: 401, body: Data(#"{"error":{"type":"authentication_error"}}"#.utf8)),
+            .init(status: 200, body: Data("""
+            {"usage":{\
+            "rolling":{"status":"ok","percent":7,"resetsAt":"2026-11-06T12:31:06.611Z"},\
+            "weekly":{"status":"ok","percent":10,"resetsAt":"2026-11-07T00:00:00.611Z"},\
+            "monthly":{"status":"ok","percent":8,"resetsAt":"2026-12-03T13:09:45.611Z"}}}
+            """.utf8)),
+        ])
+        let snapshot = try await provider([expiredKey, liveSignIn]).fetchSnapshot()
+        XCTAssertEqual(snapshot.status, .ok)
+        XCTAssertEqual(snapshot.windows.map(\.id), ["rolling", "weekly", "monthly"])
+        XCTAssertEqual(OpenCodeEndpoint.requestURLs.map(\.path),
+                       ["/zen/go/v1/usage", "/inference/go/v1/usage"])
+    }
+
+    /// With every credential refused the verdict is the last one's — the
+    /// sign-in's, which is the one that can say "sign in again" with authority.
+    func testEveryCredentialRefusedIsASignOut() async throws {
+        // The sign-in's 401 is checked against the console before it counts,
+        // and the console refuses it too.
+        OpenCodeEndpoint.reset([.init(status: 401), .init(status: 401), .init(status: 401)])
+        do {
+            _ = try await provider([expiredKey, liveSignIn]).fetchSnapshot()
+            XCTFail("a refused sign-in is not a reading")
+        } catch UsageProviderError.needsAuth {
+            XCTAssertEqual(OpenCodeEndpoint.requestCount, 3)
+        }
+    }
+
+    /// A rate limit on the first credential is an answer, not a turning-away:
+    /// the next credential is not spent on the same limit.
+    func testARateLimitDoesNotMoveOnToTheNextCredential() async throws {
+        OpenCodeEndpoint.reset([.init(status: 429)])
+        do {
+            _ = try await provider([expiredKey, liveSignIn]).fetchSnapshot()
+            XCTFail("a rate limit is not a reading")
+        } catch UsageProviderError.rateLimited {
+            XCTAssertEqual(OpenCodeEndpoint.requestCount, 1)
+        }
+    }
+
+    private var reading: OpenCodeEndpoint.Answer {
+        .init(status: 200, body: Data(#"{"usage":{"rolling":{"status":"ok","percent":7}}}"#.utf8))
+    }
+
+    /// A store boundary is not an authentication boundary. The file's OAuth
+    /// login must get a turn after a refused database key, with mirrors sent
+    /// only once on each route and Go preceding OAuth inside either store.
+    func testDatabaseDeadKeyFallsThroughToFileLogin() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-mixed-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let db = try database([("opencode-go", #"{"type":"api","key":"sk-expired"}"#, 1, 3)])
+        defer { try? FileManager.default.removeItem(at: db) }
+        try FileManager.default.copyItem(at: db, to: directory.appendingPathComponent("opencode.db"))
+        try #"{"opencode-go":{"type":"api","key":"sk-expired"},"opencode":{"type":"oauth","access":"st_live"}}"#
+            .write(to: directory.appendingPathComponent("auth.json"), atomically: true, encoding: .utf8)
+        let candidates = OpenCodeCredentials.candidates(in: directory)
+        XCTAssertEqual(candidates.map(\.token), ["sk-expired", "st_live"])
+        OpenCodeEndpoint.reset([.init(status: 401), reading])
+        let snapshot = try await provider(candidates).fetchSnapshot()
+        XCTAssertEqual(snapshot.status, .ok)
+        XCTAssertEqual(OpenCodeEndpoint.requestURLs.map(\.path), ["/zen/go/v1/usage", "/inference/go/v1/usage"])
+    }
+
+    func testFileOnlyCandidatesKeepGoBeforeOAuth() throws {
+        let auth = try file(#"{"opencode-go":{"type":"api","key":"sk-file"},"opencode":{"type":"oauth","access":"st_file"}}"#)
+        let directory = auth.deletingLastPathComponent().appendingPathComponent("opencode-file-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            try? FileManager.default.removeItem(at: auth)
+        }
+        try FileManager.default.copyItem(at: auth, to: directory.appendingPathComponent("auth.json"))
+        XCTAssertEqual(OpenCodeCredentials.candidates(in: directory).map(\.token), ["sk-file", "st_file"])
+    }
+
+    func testEveryRefusalPreservesOAuthExpiry() async throws {
+        let expired = OpenCodeCredentials.Credential(token: "st_old", oauth: true, console: nil,
+            org: nil, expires: Date(timeIntervalSince1970: 1), source: "OpenCode")
+        OpenCodeEndpoint.reset([.init(status: 401), .init(status: 401), .init(status: 401)])
+        do {
+            _ = try await provider([expiredKey, expired]).fetchSnapshot()
+            XCTFail("an expired login is not a reading")
+        } catch UsageProviderError.credentialExpired {
+            XCTAssertEqual(OpenCodeEndpoint.requestCount, 3)
+        }
+    }
+
+    func testConsoleAcceptedAfterBothUsageRefusalsMeansNothingMetered() async throws {
+        OpenCodeEndpoint.reset([.init(status: 401), .init(status: 401), .init(status: 200)])
+        do {
+            _ = try await provider([expiredKey, liveSignIn]).fetchSnapshot()
+            XCTFail("a console login is not a Go subscription")
+        } catch UsageProviderError.nothingMetered {
+            XCTAssertEqual(OpenCodeEndpoint.requestCount, 3)
+        }
+    }
+
+    func testKey403StillTriesOAuthAndRemembersTheSuccess() async throws {
+        OpenCodeEndpoint.reset([.init(status: 403), reading, reading])
+        let p = try provider([expiredKey, liveSignIn])
+        let first = try await p.fetchSnapshot()
+        let next = try await p.fetchSnapshot()
+        XCTAssertEqual(first.status, .ok)
+        XCTAssertEqual(next.status, .ok)
+        XCTAssertEqual(OpenCodeEndpoint.requestURLs.map(\.path),
+                       ["/zen/go/v1/usage", "/inference/go/v1/usage", "/inference/go/v1/usage"])
+    }
+
+    func testKey403StandsWhenNoCandidateWorks() async throws {
+        OpenCodeEndpoint.reset([.init(status: 403), .init(status: 401), .init(status: 401)])
+        do {
+            _ = try await provider([expiredKey, liveSignIn]).fetchSnapshot()
+            XCTFail("all candidates failed")
+        } catch UsageProviderError.nothingMetered {
+            XCTAssertEqual(OpenCodeEndpoint.requestCount, 3)
+        }
+    }
+
+    func testOAuthRateLimitAfterKeyRefusalStands() async throws {
+        OpenCodeEndpoint.reset([.init(status: 401), .init(status: 429)])
+        do {
+            _ = try await provider([expiredKey, liveSignIn]).fetchSnapshot()
+            XCTFail("a rate limit is not an authentication refusal")
+        } catch UsageProviderError.rateLimited {
+            XCTAssertEqual(OpenCodeEndpoint.requestCount, 2)
+        }
+    }
+
+    func testDuplicateTokensAreSentOncePerRoute() async throws {
+        OpenCodeEndpoint.reset([.init(status: 401), reading])
+        let snapshot = try await provider([expiredKey, expiredKey, liveSignIn, liveSignIn]).fetchSnapshot()
+        XCTAssertEqual(snapshot.status, .ok)
+        XCTAssertEqual(OpenCodeEndpoint.requestCount, 2)
+        let keyWithSameToken = OpenCodeCredentials.Credential(token: liveSignIn.token, oauth: false,
+            console: nil, org: nil, expires: nil, source: "OpenCode")
+        XCTAssertEqual(OpenCodeCredentials.unique([keyWithSameToken, liveSignIn]).count, 2,
+                       "a token on a different route is a distinct candidate")
+    }
+
+    // MARK: - Presence
+
+    /// Installed-but-signed-out and never-installed are different answers, so
+    /// presence is asked of the files rather than of the credential.
+    func testPresenceNeedsEitherFile() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("opencode-empty-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        XCTAssertFalse(OpenCodeCredentials.present(in: directory))
+
+        try Data().write(to: directory.appendingPathComponent("opencode.db"))
+        XCTAssertTrue(OpenCodeCredentials.present(in: directory))
+    }
+}
+
+/// Recorded from a live `oc_sk_` key the usage endpoint refused. The body is
+/// enough: recognizing it must not need the network, and must not be confused
+/// with every other 401.
+final class OpenCodeExpiredKeyTests: XCTestCase {
+    private let expired = """
+    {"error":{"type":"authentication_error","code":"api_key_expired","message":"This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key."}}
+    """
+
+    func testAnExpiredConsoleKeyIsRecognized() {
+        XCTAssertTrue(OpenCodeProvider.isExpiredAPIKey(Data(expired.utf8)))
+    }
+
+    func testADifferentUnauthorizedCodeIsNotAnExpiredKey() {
+        let body = Data(
+            #"{"error":{"type":"authentication_error","code":"invalid_api_key","message":"bad key"}}"#
+                .utf8)
+        XCTAssertFalse(OpenCodeProvider.isExpiredAPIKey(body))
+    }
+}
+
+/// Answers queued in order, whatever the URL, and remembers what was asked.
+private final class OpenCodeEndpoint: URLProtocol {
+    struct Answer {
+        let status: Int
+        var body: Data = Data()
+    }
+
+    private static let lock = NSLock()
+    private static var queued: [Answer] = []
+    private static var served = 0
+    private static var urls: [URL] = []
+
+    static var requestURLs: [URL] {
+        lock.lock(); defer { lock.unlock() }
+        return urls
+    }
+
+    static var requestCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return served
+    }
+
+    static func reset(_ answers: [Answer]) {
+        lock.lock(); queued = answers; served = 0; urls = []; lock.unlock()
+    }
+
+    static func session() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [OpenCodeEndpoint.self]
+        return URLSession(configuration: configuration)
+    }
+
+    private static func next(for request: URLRequest) -> Answer {
+        lock.lock(); defer { lock.unlock() }
+        served += 1
+        if let url = request.url { urls.append(url) }
+        // Running dry is a test bug, and a 500 says so more clearly than a
+        // crash inside URLSession's callback would.
+        return queued.isEmpty ? Answer(status: 500) : queued.removeFirst()
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let answer = Self.next(for: request)
+        let response = HTTPURLResponse(url: request.url!,
+                                       statusCode: answer.status,
+                                       httpVersion: "HTTP/1.1",
+                                       headerFields: ["Content-Type": "application/json"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: answer.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
